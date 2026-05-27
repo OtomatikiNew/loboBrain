@@ -1,5 +1,393 @@
 # Release notes — Homeassistant Sports Club Dashboard API v1.0.45
 
+## Version objective
+
+This version introduces a stable naming layer for the binary sensors created in Home Assistant by the add-on.
+
+Until now, the add-on created Home Assistant entities directly using the internal identifiers received from SrLobo / OK Cloud / MQTT. For example:
+
+* `binary_sensor.66`
+* `binary_sensor.67`
+* `binary_sensor.68`
+* `binary_sensor.door33`
+* `binary_sensor.door48`
+
+This meant that dashboards and automations depended on internal IDs that could vary between clubs or installations. In one club, courts could appear as `binary_sensor.66`, `binary_sensor.67`, etc.; in another as `binary_sensor.70`, `binary_sensor.71`; and in another as `binary_sensor.72`, `binary_sensor.73`.
+
+With this version, the add-on still internally uses the real IDs received from the backend/MQTT, but now exposes stable and predictable entities in Home Assistant:
+
+* `binary_sensor.pista_1`
+* `binary_sensor.pista_2`
+* `binary_sensor.pista_3`
+* ...
+* `binary_sensor.puerta_1`
+* `binary_sensor.puerta_2`
+* ...
+
+The original `friendly_name` is not modified. This means an entity may internally be named `binary_sensor.pista_1`, while still being displayed in Home Assistant as `Platz 1/ Sport Treff Rorschach`, `Red Court`, `Blue Court`, `Main Door`, etc.
+
+## Previous behavior
+
+Before this version, courts were published in Home Assistant using the internal ID received from the backend. Example:
+
+```text
+backend/MQTT id 66 -> binary_sensor.66
+backend/MQTT id 67 -> binary_sensor.67
+backend/MQTT id 68 -> binary_sensor.68
+```
+
+Doors were published using the `door` prefix followed by the internal ID:
+
+```text
+backend/MQTT door id 33 -> binary_sensor.door33
+backend/MQTT door id 48 -> binary_sensor.door48
+```
+
+This forced users to modify blueprints, automations, and dashboards every time a club used different IDs.
+
+## New behavior
+
+The add-on now builds a mapping table during startup, based on the lists of courts and doors received from the backend.
+
+For courts:
+
+```text
+first court sensor received  -> binary_sensor.pista_1
+second court sensor received -> binary_sensor.pista_2
+third court sensor received  -> binary_sensor.pista_3
+...
+```
+
+For doors:
+
+```text
+first door received  -> binary_sensor.puerta_1
+second door received -> binary_sensor.puerta_2
+third door received  -> binary_sensor.puerta_3
+...
+```
+
+Example:
+
+```text
+backend/MQTT id 66 -> binary_sensor.pista_1
+backend/MQTT id 67 -> binary_sensor.pista_2
+backend/MQTT id 68 -> binary_sensor.pista_3
+backend/MQTT id 69 -> binary_sensor.pista_4
+
+backend/MQTT door id 33 -> binary_sensor.puerta_1
+backend/MQTT door id 48 -> binary_sensor.puerta_2
+```
+
+## What does NOT change
+
+This version does not change:
+
+* The MQTT topics used by the backend.
+* The real IDs received through MQTT.
+* The `friendly_name` shown in Home Assistant.
+* The `on` / `off` state logic.
+* The brightness and `meta_state` attributes of the courts.
+* The `device_class` of courts (`light`).
+* The `device_class` of doors (`door`).
+* The integration with SrLobo / OK Cloud.
+* The state update logic back to the backend.
+
+The change mainly affects how the entity is named inside Home Assistant.
+
+## Modified files
+
+### `homeassistant_club_dashboard_api/config.yaml`
+
+The add-on version has been updated:
+
+```diff
+-version: "1.0.44"
++version: "1.0.45"
+```
+
+### `homeassistant_club_dashboard_api/homeassistant_club_dashboard_api/__main__.py`
+
+A stable mapping layer has been added between internal IDs and the entity names exposed in Home Assistant.
+
+## New internal mapping tables
+
+Internal structures were added to translate between received IDs and stable Home Assistant entities:
+
+```python
+LIGHT_ENTITY_MAP = {}
+LIGHT_ENTITY_REVERSE_MAP = {}
+DOOR_ENTITY_MAP = {}
+DOOR_ENTITY_REVERSE_MAP = {}
+```
+
+These tables allow the add-on to internally receive or process IDs such as `66`, `67`, `33`, `48`, while publishing or updating entities such as `pista_1`, `pista_2`, `puerta_1`, `puerta_2` in Home Assistant.
+
+## New helper functions
+
+Helper functions were added to centralize entity name translation:
+
+```python
+def get_stable_light_entity_id(light_id):
+    return LIGHT_ENTITY_MAP.get(str(light_id), str(light_id))
+```
+
+Returns the stable court name. Example:
+
+```text
+66 -> pista_1
+67 -> pista_2
+```
+
+```python
+def get_original_light_id(entity_id):
+    suffix = _entity_suffix(entity_id)
+    return LIGHT_ENTITY_REVERSE_MAP.get(suffix, suffix)
+```
+
+Allows recovery of the original internal ID when sending updates back to the backend.
+
+```python
+def get_stable_door_entity_id(door_id):
+    return DOOR_ENTITY_MAP.get(str(door_id), 'door{}'.format(door_id))
+```
+
+Returns the stable door name. Example:
+
+```text
+33 -> puerta_1
+48 -> puerta_2
+```
+
+```python
+def get_original_door_id(entity_id):
+    suffix = _entity_suffix(entity_id)
+    return DOOR_ENTITY_REVERSE_MAP.get(suffix, suffix.replace('door', ''))
+```
+
+Allows recovery of the original door ID when sending updates back to the backend.
+
+## Changes in court sensor creation
+
+Previously, the Home Assistant entity directly used the court ID:
+
+```python
+light_id = light[1]
+```
+
+Now a stable mapping is created while iterating through the court list:
+
+```python
+for index, light in enumerate(lights, start=1):
+    stable_entity_id = f"pista_{index}"
+    LIGHT_ENTITY_MAP[str(light[1])] = stable_entity_id
+    LIGHT_ENTITY_MAP[str(light[0])] = stable_entity_id
+    LIGHT_ENTITY_REVERSE_MAP[stable_entity_id] = str(light[0])
+```
+
+Then, when creating the entity in Home Assistant:
+
+```python
+light_id = get_stable_light_entity_id(light[1])
+```
+
+Result:
+
+```text
+binary_sensor.pista_1
+binary_sensor.pista_2
+binary_sensor.pista_3
+...
+```
+
+## Changes in court sensor updates
+
+Previously, when an MQTT update arrived, the entity was updated directly using the received ID:
+
+```python
+data_from_mqtt = court_id
+```
+
+Now the received ID is translated into the stable name:
+
+```python
+data_from_mqtt = get_stable_light_entity_id(court_id)
+```
+
+So if an update arrives for internal court `66`, the add-on updates:
+
+```text
+binary_sensor.pista_1
+```
+
+instead of:
+
+```text
+binary_sensor.66
+```
+
+## Changes in door sensor creation
+
+Previously, doors were created as:
+
+```python
+entity_id = "door{}".format(door[1])
+```
+
+Now a stable mapping is created while iterating through the door list:
+
+```python
+for index, door in enumerate(doors, start=1):
+    stable_entity_id = f"puerta_{index}"
+    DOOR_ENTITY_MAP[str(door[1])] = stable_entity_id
+    DOOR_ENTITY_MAP[str(door[0])] = stable_entity_id
+    DOOR_ENTITY_REVERSE_MAP[stable_entity_id] = str(door[1])
+```
+
+Then:
+
+```python
+stable_door_entity_id = get_stable_door_entity_id(door[1])
+```
+
+Result:
+
+```text
+binary_sensor.puerta_1
+binary_sensor.puerta_2
+...
+```
+
+## Changes in door sensor updates
+
+Previously, when a door update arrived, the following entity was updated:
+
+```python
+data_from_mqtt = "door{}".format(door_id)
+```
+
+Now the received ID is translated into the stable name:
+
+```python
+data_from_mqtt = get_stable_door_entity_id(door_id)
+```
+
+So if an update arrives for internal door `33`, the add-on updates:
+
+```text
+binary_sensor.puerta_1
+```
+
+instead of:
+
+```text
+binary_sensor.door33
+```
+
+## Changes in updates sent from Home Assistant back to the backend
+
+The reverse flow was also updated.
+
+Previously, when Home Assistant sent a court update, the code extracted the ID directly from the entity name:
+
+```python
+id = entity_id.split('.')[1]
+```
+
+This worked for `binary_sensor.66`, but not for `binary_sensor.pista_1`.
+
+Now it uses:
+
+```python
+id = get_original_light_id(entity_id)
+```
+
+This allows Home Assistant to work with `binary_sensor.pista_1` while the backend still receives the correct internal ID.
+
+For doors, previously:
+
+```python
+id = entity_id[len('binary_sensor.door'):]
+```
+
+Now:
+
+```python
+id = get_original_door_id(entity_id)
+```
+
+This allows Home Assistant to work with `binary_sensor.puerta_1` while the backend still receives the correct internal ID.
+
+## Impact on dashboards and automations
+
+From this version onward, dashboards and automations can be configured using stable and generic entities:
+
+```yaml
+binary_sensor.pista_1
+binary_sensor.pista_2
+binary_sensor.pista_3
+...
+binary_sensor.puerta_1
+binary_sensor.puerta_2
+```
+
+This avoids manually adapting dashboards or blueprints whenever a club uses different internal IDs.
+
+Example blueprint:
+
+```yaml
+sensor_presencia: binary_sensor.pista_1
+```
+
+Example dashboard:
+
+```yaml
+sensor: binary_sensor.pista_1
+```
+
+## Compatibility
+
+The change maintains full backend compatibility because the internal IDs still exist inside the add-on and are used whenever it is necessary to communicate state changes back to SrLobo / OK Cloud.
+
+The difference is that Home Assistant is no longer exposed to those internal IDs.
+
+## Migration note
+
+After installing this version, old entities such as:
+
+```text
+binary_sensor.66
+binary_sensor.67
+binary_sensor.door33
+```
+
+will no longer be the primary entities expected by the new dashboard.
+
+Dashboards and automations should be updated to use:
+
+```text
+binary_sensor.pista_1
+binary_sensor.pista_2
+binary_sensor.puerta_1
+```
+
+as appropriate.
+
+## Review note
+
+During the file comparison for this version, actual changes were detected in:
+
+* `homeassistant_club_dashboard_api/config.yaml`
+* `homeassistant_club_dashboard_api/homeassistant_club_dashboard_api/__main__.py`
+
+A `__pycache__` file also appeared inside the modified ZIP package. This file is not required for add-on functionality and can be removed before publishing the final version to keep the package clean. 
+
+
+
+
+
+# Release notes — Homeassistant Sports Club Dashboard API v1.0.45
+
 ## Objetivo de la versión
 
 Esta versión introduce una capa de nombres estables para los sensores binarios creados en Home Assistant por el add-on.
