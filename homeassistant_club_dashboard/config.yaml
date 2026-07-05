@@ -1,6 +1,6 @@
 name: "Homeassistant Sports Club Dashboard"
 description: "A custom dashboard for an intergration of Syltek and Home Assistant"
-version: "1.0.23"
+version: "1.0.24"
 slug: "homeassistant_club_dashboard"
 webui: "http://[HOST]:[PORT:8000]"
 init: false
