@@ -79,6 +79,34 @@ def get_original_door_id(entity_id):
     suffix = _entity_suffix(entity_id)
     return DOOR_ENTITY_REVERSE_MAP.get(suffix, suffix.replace('door', ''))
 
+# Home Assistant state normalization -------------------------------------------------------------
+# Different OK Cloud connectors can encode an OFF light state using different values:
+# "off", "false", 0, False, "closed", etc. Home Assistant binary sensors must receive
+# an explicit "off"/"on" state. Any positive/dimmed light level is treated as "on".
+OFF_LIGHT_VALUES = {"off", "false", "0", "none", "null", "", "closed"}
+
+def normalize_ha_light_state(state, brightness_pct=None):
+    normalized_state = str(state).strip().lower()
+
+    if normalized_state in OFF_LIGHT_VALUES:
+        return "off"
+
+    if normalized_state == "dim":
+        try:
+            return "on" if int(brightness_pct or 0) > 0 else "off"
+        except Exception:
+            return "on"
+
+    return "on"
+
+def normalize_ha_light_brightness(state, brightness_pct=None):
+    if normalize_ha_light_state(state, brightness_pct) == "off":
+        return 0
+    try:
+        return int(brightness_pct) if brightness_pct is not None else 100
+    except Exception:
+        return 100
+
 
 #Ignore sun light status-----------------------------------------------------------------------------------------------------------------------
 def checkIgnoreSunLight():
@@ -512,20 +540,20 @@ def fetch_court_ids():
                 "Content-Type": "application/json",
             }
             
-            if state == 'off':
+            if normalize_ha_light_state(state) == "off":
                 brightness_pct = 0
-            elif state == 'on':
+            elif str(state).strip().lower() == "on":
                 brightness_pct = max_level
             else:
                 brightness_pct = min_level
 
             sensor_data = {
                 "entity_id": light_id,
-                "state": "off" if state == "off" else "on",
+                "state": normalize_ha_light_state(state, brightness_pct),
                 "attributes": {
                     "friendly_name": friendly_name,
                     "device_class": "light", 
-                    "brightness": 0 if state == "off" else max_level if state == "on" else min_level,   
+                    "brightness": normalize_ha_light_brightness(state, brightness_pct),   
                     "meta_state": state         
                 },
             }
@@ -744,9 +772,15 @@ def listen_mqtt_light_topics(court_ids):
                 parsed_payload = json.loads(payload)
                 logging.info(f"Parsed Payload2: {parsed_payload}")
 
-                logging.info(f"Court ID: {court_id}, New State: {parsed_payload['state']} , Brightness: {parsed_payload['brightness_pct']}")
-                # print("Court Id: ",court_id,"State: ", state)
-                fetch_data_with_light_id(parsed_payload['state'], court_id, parsed_payload['brightness_pct'])
+                # Handle both string payload ("on"/"off") and dict payload ({"state": "on", "brightness_pct": 100})
+                if isinstance(parsed_payload, str):
+                    state_value = parsed_payload
+                    brightness_value = 100 if parsed_payload == 'on' else 0
+                else:
+                    state_value = parsed_payload['state']
+                    brightness_value = parsed_payload['brightness_pct']
+                logging.info(f"Court ID: {court_id}, New State: {state_value} , Brightness: {brightness_value}")
+                fetch_data_with_light_id(state_value, court_id, brightness_value)
                 logging.info("State change Manually////////////////////////////////////////////")
 
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -786,7 +820,7 @@ def fetch_data_with_light_id(state,court_id,brightness_pct= None):
         }
         
         if brightness_pct is None:
-            brightness_pct = 100 if state == "on" else 0
+            brightness_pct = 100 if normalize_ha_light_state(state) == "on" else 0
 
         data_from_mqtt = get_stable_light_entity_id(court_id)
         api_url_sensor = api_url.format(data_from_mqtt)
@@ -798,11 +832,11 @@ def fetch_data_with_light_id(state,court_id,brightness_pct= None):
 
             sensor_data = {
                 "entity_id": data_from_mqtt,
-                "state": "off" if state == "off" else "on",
+                "state": normalize_ha_light_state(state, brightness_pct),
                 "attributes": {
                     "friendly_name": respose_get_entity.json()['attributes']['friendly_name'],
                     "device_class": "light",
-                    "brightness": brightness_pct,
+                    "brightness": normalize_ha_light_brightness(state, brightness_pct),
                     "meta_state": state 
                 },
             }
