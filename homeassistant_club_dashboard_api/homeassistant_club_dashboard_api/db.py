@@ -166,15 +166,17 @@ def getLights(ok_cloud_access_token,back_end_url,club_uuid, club_id, facility_id
                             item['limited_option'],
                         ])
                     else:
+                        # Taykus courts do not have min_level, max_level or limited_option
+                        # Use safe defaults to avoid KeyError
                         lights_data.append([
                             str(item['id']),
                             item['court_id'],
                             item['automatic_mode'],
                             item['name'],
                             item['status'],
-                            item['min_level'],
-                            item['max_level'],
-                            item['limited_option'],
+                            item.get('min_level', 0),
+                            item.get('max_level', 100),
+                            item.get('limited_option', False),
                     ])
 
             return lights_data
