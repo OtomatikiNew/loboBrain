@@ -731,11 +731,12 @@ def listen_mqtt_light_topics(court_ids):
                 if integrated_club:
                     # array_of_payload = [{'court_id': int(key), 'state': value} for key, value in parsed_payload.items()]
                     
+                    # value can be a string ('true'/'false') for Taykus, or a dict with 'state'/'brightness_pct' for others
                     array_of_payload = [
                         {
                             'court_id': int(key),
-                            'state': value.get('state'),
-                            'brightness_pct': value.get('brightness_pct')
+                            'state': value if isinstance(value, str) else value.get('state'),
+                            'brightness_pct': None if isinstance(value, str) else value.get('brightness_pct')
                         }
                         for key, value in parsed_payload.items()
                     ]
