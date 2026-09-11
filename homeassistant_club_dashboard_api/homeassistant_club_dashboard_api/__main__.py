@@ -1,4 +1,5 @@
 import os
+import re
 from flask import Flask, request, render_template
 from flask_cors import CORS
 from threading import Thread
@@ -32,6 +33,20 @@ logging.basicConfig(level=logging.DEBUG)
 app.config['SECRET_KEY'] = 'secret!'
 socketio = SocketIO(app, cors_allowed_origins='*')
 
+# Minimal "last desired state" + retry mechanism -----------------------------
+# Added 2026-09-11. Scope: court lights only (fetch_data_with_light_id),
+# which is where the production bug was observed. Deliberately NOT a
+# persisted/SQLite-backed queue with a full sync_status state machine --
+# LoboBrain is deprecated in favor of automation_bridge (v2.0, ADR-013
+# already covers offline-safe delivery there with a different mechanism,
+# MQTT retained snapshots). This in-memory version only needs to survive
+# a *Home Assistant* restart while LoboBrain itself keeps running, which
+# is the actual failure mode seen in production -- if LoboBrain itself
+# restarts, it reconnects to providers and receives fresh state anyway.
+pending_light_writes = {}
+pending_light_writes_lock = threading.Lock()
+PENDING_RETRY_INTERVAL_SECONDS = 7
+
 #Variables-----------------------------------------------------------------------------------------------------------------------
 club_uuid = ""
 club_name = ""
@@ -41,7 +56,13 @@ mqtt_user_password = ""
 mqtt_broker = ""
 mqtt_port = ""
 api_genaration_url = 'https://pro.syltek.com/hermes/api/v1/Lights/plcnext/register?'
-home_assistant_url = 'http://homeassistant.local:8123'
+# Fixed 2026-09-11: was 'http://homeassistant.local:8123', an mDNS hostname
+# that can go stale after Home Assistant Core restarts (container gets a new
+# internal IP, this add-on's DNS resolution isn't refreshed until the add-on
+# itself restarts). The Supervisor proxy is the officially documented,
+# network-stable way for an add-on to reach Core -- no mDNS involved.
+home_assistant_url = 'http://supervisor/core'
+HA_REQUEST_TIMEOUT = (3, 5)  # (connect timeout, read timeout) seconds
 global_tenant = ''
 global_idTerminal=''
 global_cardCode = ''
@@ -65,15 +86,39 @@ DOOR_ENTITY_REVERSE_MAP = {}   # HA entity suffix (puerta_N) -> backend door id
 def _entity_suffix(entity_id):
     return str(entity_id).replace('binary_sensor.', '')
 
+_SAFE_ENTITY_SUFFIX = re.compile(r'^[a-zA-Z0-9_]+$')
+
+def _sanitize_entity_suffix(raw_suffix, context=""):
+    """
+    Defensive check before any entity suffix is interpolated into a
+    Home Assistant REST URL (.../api/states/binary_sensor.<suffix>).
+    Added 2026-09-11 -- there was previously no validation at all on
+    IDs coming from MQTT topic segments before they were used to build
+    the request URL.
+    """
+    suffix = str(raw_suffix)
+    if not _SAFE_ENTITY_SUFFIX.match(suffix):
+        logging.warning(
+            "Rejected unsafe entity suffix in %s: %r", context, raw_suffix
+        )
+        # Strip to only safe characters rather than passing the raw value
+        # through -- keeps the system running instead of hard-failing on
+        # a single bad message, while still refusing to build a URL from
+        # anything containing '/', '.', '..', etc.
+        suffix = re.sub(r'[^a-zA-Z0-9_]', '', suffix)
+    return suffix
+
 def get_stable_light_entity_id(light_id):
-    return LIGHT_ENTITY_MAP.get(str(light_id), str(light_id))
+    entity_id = LIGHT_ENTITY_MAP.get(str(light_id), str(light_id))
+    return _sanitize_entity_suffix(entity_id, context="light_entity_id")
 
 def get_original_light_id(entity_id):
     suffix = _entity_suffix(entity_id)
     return LIGHT_ENTITY_REVERSE_MAP.get(suffix, suffix)
 
 def get_stable_door_entity_id(door_id):
-    return DOOR_ENTITY_MAP.get(str(door_id), 'door{}'.format(door_id))
+    entity_id = DOOR_ENTITY_MAP.get(str(door_id), 'door{}'.format(door_id))
+    return _sanitize_entity_suffix(entity_id, context="door_entity_id")
 
 def get_original_door_id(entity_id):
     suffix = _entity_suffix(entity_id)
@@ -562,7 +607,7 @@ def fetch_court_ids():
             logging.info('entity id form mqtt:'+str(data_from_mqtt))
 
             api_url_sensor = api_url.format(data_from_mqtt)
-            response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers)
+            response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers, timeout=HA_REQUEST_TIMEOUT)
 
             if response4.status_code == 200:
                 logging.info(f"Light entity {data_from_mqtt} updated successfully!") 
@@ -776,6 +821,9 @@ def listen_mqtt_light_topics(court_ids):
                 # Handle both string payload ("on"/"off") and dict payload ({"state": "on", "brightness_pct": 100})
                 if isinstance(parsed_payload, str):
                     state_value = parsed_payload
+                    # No explicit brightness in this payload shape: treat
+                    # on=100 / off=0, same convention as fetch_data_with_light_id's
+                    # own default. Kept explicit here for clarity.
                     brightness_value = 100 if parsed_payload == 'on' else 0
                 else:
                     state_value = parsed_payload['state']
@@ -820,29 +868,43 @@ def fetch_data_with_light_id(state,court_id,brightness_pct= None):
             "Content-Type": "application/json",
         }
         
+        # No brightness info at all: default on=100 / off=0 (per Alvaro,
+        # 2026-09-11 -- this is the original, intentional behavior for
+        # binary_sensor lights with no real dimming capability).
+        has_explicit_brightness = True
         if brightness_pct is None:
             brightness_pct = 100 if normalize_ha_light_state(state) == "on" else 0
 
         data_from_mqtt = get_stable_light_entity_id(court_id)
         api_url_sensor = api_url.format(data_from_mqtt)
 
-        respose_get_entity = requests.get(api_url_sensor, headers=headers)
+        # Persist the desired state BEFORE attempting the write, so that if
+        # HA is unreachable right now (e.g. mid-restart), this command is
+        # retried automatically by retry_pending_light_writes() instead of
+        # being silently lost. See pending_light_writes above.
+        with pending_light_writes_lock:
+            pending_light_writes[data_from_mqtt] = (state, court_id, brightness_pct)
+
+        respose_get_entity = requests.get(api_url_sensor, headers=headers, timeout=HA_REQUEST_TIMEOUT)
 
         if respose_get_entity.status_code == 200:
             logging.info(respose_get_entity.json())
 
+            attributes = {
+                "friendly_name": respose_get_entity.json()['attributes']['friendly_name'],
+                "device_class": "light",
+                "meta_state": state
+            }
+            if has_explicit_brightness:
+                attributes["brightness"] = normalize_ha_light_brightness(state, brightness_pct)
+
             sensor_data = {
                 "entity_id": data_from_mqtt,
                 "state": normalize_ha_light_state(state, brightness_pct),
-                "attributes": {
-                    "friendly_name": respose_get_entity.json()['attributes']['friendly_name'],
-                    "device_class": "light",
-                    "brightness": normalize_ha_light_brightness(state, brightness_pct),
-                    "meta_state": state 
-                },
+                "attributes": attributes,
             }
             
-            response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers)
+            response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers, timeout=HA_REQUEST_TIMEOUT)
 
             if response4.status_code == 200:
                 logging.info(f"Light entity {data_from_mqtt} updated successfully!")    
@@ -850,13 +912,48 @@ def fetch_data_with_light_id(state,court_id,brightness_pct= None):
                 logging.info(f"Light entity {data_from_mqtt} created successfully!") 
             else:
                 logging.info(f"Error creating light entity {data_from_mqtt}: {response4.status_code} - {response4.text}")
+                return
+
+            # Only reached on a successful write (200/201 above) -- clear
+            # the pending marker. If we returned early on a non-2xx status,
+            # it stays pending and the retry worker will pick it up.
+            with pending_light_writes_lock:
+                # Only clear it if nothing newer has been queued for this
+                # entity since we started this attempt.
+                if pending_light_writes.get(data_from_mqtt) == (state, court_id, brightness_pct):
+                    pending_light_writes.pop(data_from_mqtt, None)
+        else:
+            logging.info(
+                f"Could not fetch current state for {data_from_mqtt} "
+                f"(status {respose_get_entity.status_code}) -- leaving desired "
+                f"state pending, will retry."
+            )
+            return
 
         # publish_light_state(court_id, state, brightness_pct)
 
         logging.info(f"Updated light state for court_id: {court_id}, state: {state}, brightness_pct: {brightness_pct}")
 
     except Exception as e:
+          # Left in pending_light_writes on purpose -- the retry worker
+          # will pick this entity up again on its next pass.
           logging.info(f"An error occurr while updating light states: {e}")
+
+
+def retry_pending_light_writes():
+    """
+    Background worker: every PENDING_RETRY_INTERVAL_SECONDS, re-attempts
+    any light write that didn't confirm success last time (HA unreachable,
+    non-2xx response, or an exception). Added 2026-09-11.
+    """
+    while True:
+        time.sleep(PENDING_RETRY_INTERVAL_SECONDS)
+        with pending_light_writes_lock:
+            snapshot = list(pending_light_writes.values())
+        if snapshot:
+            logging.info(f"Retrying {len(snapshot)} pending light write(s)...")
+        for state, court_id, brightness_pct in snapshot:
+            fetch_data_with_light_id(state, court_id, brightness_pct)
 
 #---------------------------------------------------------------------------------------------------------
 
@@ -1171,7 +1268,7 @@ def fetch_door_ids():
             logging.info('entity id form mqtt:'+str(data_from_mqtt))
 
             api_url_sensor = api_url.format(data_from_mqtt)
-            response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers)
+            response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers, timeout=HA_REQUEST_TIMEOUT)
 
             if response4.status_code == 200:
                 logging.info(f"Binary sensor {data_from_mqtt} updated successfully!") 
@@ -1359,7 +1456,7 @@ def fetch_data_with_door_id(state,door_id):
 
         api_url_sensor = api_url.format(data_from_mqtt)
 
-        respose_get_entity = requests.get(api_url_sensor, headers=headers)
+        respose_get_entity = requests.get(api_url_sensor, headers=headers, timeout=HA_REQUEST_TIMEOUT)
         if respose_get_entity.status_code == 200:
             logging.info(respose_get_entity.json())
             sensor_data = {
@@ -1372,7 +1469,7 @@ def fetch_data_with_door_id(state,door_id):
             }
             
             
-            response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers)
+            response4 = requests.post(api_url_sensor, json=sensor_data, headers=headers, timeout=HA_REQUEST_TIMEOUT)
 
             if response4.status_code == 200:
                 logging.info(f"Binary sensor {data_from_mqtt} updated successfully!") 
@@ -1611,7 +1708,7 @@ def updateEntityState(club_id):
             }
 
             # Send the POST request with headers
-            response = requests.post(url, json=body, headers=headers)
+            response = requests.post(url, json=body, headers=headers, timeout=HA_REQUEST_TIMEOUT)
             if response.status_code == 200:
                 message = "Success"
                 return message
@@ -1639,7 +1736,7 @@ def updateEntityState(club_id):
                 }
 
                 # Send the POST request with headers
-                response = requests.post(url, json=body, headers=headers)
+                response = requests.post(url, json=body, headers=headers, timeout=HA_REQUEST_TIMEOUT)
                 if response.status_code == 200:
                     message = "Success"
                     return message
@@ -1663,7 +1760,7 @@ def updateEntityState(club_id):
                 }
 
                 # Send the POST request with headers
-                response = requests.post(url, json=body, headers=headers)
+                response = requests.post(url, json=body, headers=headers, timeout=HA_REQUEST_TIMEOUT)
                 if response.status_code == 200:
                     message = "Success"
                     return message
@@ -1692,7 +1789,7 @@ def getEntityState():
             # entity_id = request.args.get('entity_id')  # Get entity_id from query parameters
 
             api_url_sensor = api_url.format(entity_id)
-            response = requests.get(api_url_sensor, headers=headers)
+            response = requests.get(api_url_sensor, headers=headers, timeout=HA_REQUEST_TIMEOUT)
 
             logging.info(response)
             result = response.json()
@@ -1718,7 +1815,7 @@ def getDoorState():
             # entity_id = request.args.get('entity_id')  # Get entity_id from query parameters
 
             api_url_sensor = api_url.format(entity_id)
-            response = requests.get(api_url_sensor, headers=headers)
+            response = requests.get(api_url_sensor, headers=headers, timeout=HA_REQUEST_TIMEOUT)
 
             if response.status_code == 200:
                 logging.info(response)
@@ -1748,7 +1845,7 @@ def getDoorStateByEntityId(entity_id):
             # entity_id = request.args.get('entity_id')  # Get entity_id from query parameters
 
             api_url_sensor = api_url.format(entity_id)
-            response = requests.get(api_url_sensor, headers=headers)
+            response = requests.get(api_url_sensor, headers=headers, timeout=HA_REQUEST_TIMEOUT)
 
             if response.status_code == 200:
                 logging.info(response)
@@ -2113,7 +2210,7 @@ def deleteDoorFromHa(entity_id):
     }
 
     api_url_sensor = api_url
-    response = requests.delete(api_url_sensor, headers=headers)
+    response = requests.delete(api_url_sensor, headers=headers, timeout=HA_REQUEST_TIMEOUT)
     
     if response.status_code == 200: 
         logging.info('Deleted')
@@ -2332,7 +2429,7 @@ def clear_all_entities():
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
       }
-      response6 = requests.get(home_assistant_url+'/api/states',headers=headers)      
+      response6 = requests.get(home_assistant_url+'/api/states', headers=headers, timeout=HA_REQUEST_TIMEOUT)      
       data = response6.json()
       filtered_list = [item for item in data if 'binary_sensor' in item['entity_id']]
       
@@ -2340,7 +2437,7 @@ def clear_all_entities():
         filtered_list_entity_id = item['entity_id']
         logging.info(filtered_list_entity_id)
 
-        response7=requests.delete(home_assistant_url+'/api/states/'+filtered_list_entity_id,headers=headers)
+        response7=requests.delete(home_assistant_url+'/api/states/'+filtered_list_entity_id, headers=headers, timeout=HA_REQUEST_TIMEOUT)
         logging.info(response7.json())
 
         # delete lights from local DB
@@ -2521,9 +2618,12 @@ def signal_handler(signal, frame):
 #Main--------------------------------------------------------------------------------------------------------------------------------
 if __name__ == '__main__':
     signal.signal(signal.SIGINT, signal_handler)
-     
+
+    retry_thread = threading.Thread(target=retry_pending_light_writes, daemon=True)
+    retry_thread.start()
+
     logging.info(club_uuid)
-    logging.info(home_assistant_access_key)
+    logging.info("home_assistant_access_key set: %s", bool(home_assistant_access_key))
     # logging.info(mqtt_user_name)
     # logging.info(mqtt_user_password)
     logging.info(mqtt_broker)
@@ -2531,7 +2631,12 @@ if __name__ == '__main__':
     if(len(sys.argv)>1): 
         club_uuid = sys.argv[1]
         if(len(sys.argv)>2):
-            home_assistant_access_key = sys.argv[2]
+            # Fixed 2026-09-11: was sys.argv[2] (home_assistant_access_token,
+            # a manually-configured long-lived token). SUPERVISOR_TOKEN is
+            # injected automatically by the Supervisor for any add-on with
+            # `homeassistant_api: true` in config.yaml -- no manual token
+            # management, and it's scoped/rotated by the Supervisor itself.
+            home_assistant_access_key = os.environ.get('SUPERVISOR_TOKEN', sys.argv[2])
             if(len(sys.argv)>3):
                 mqtt_broker = sys.argv[3]
                 if(len(sys.argv)>4):
@@ -2570,7 +2675,13 @@ if __name__ == '__main__':
 
 
                                             createTables()
-                                            clear_all_entities()    
+                                            # Removed 2026-09-11: clear_all_entities() deleted EVERY
+                                            # binary_sensor.* entity in the whole Home Assistant instance
+                                            # on every add-on restart -- including entities that have
+                                            # nothing to do with LoboBrain (solar-permission helpers,
+                                            # manual-mode helpers, unrelated Shelly sensors, etc).
+                                            # Confirmed in production logs, 2026-09-11.
+                                            # clear_all_entities()
                                             # create_doors_in_ha_from_db()
                                             # t1 = threading.Thread(target=slytekIntergration, name='t1',daemon = True)
                                             # t2 = threading.Thread(target=mqtt_process_thread, name='t2',daemon = True)

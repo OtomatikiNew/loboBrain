@@ -1,8 +1,9 @@
 name: "Homeassistant Sports Club Dashboard API"
 description: "An intergration of Syltek and Home Assistant with a custom dashboard"
-version: "1.0.47"
+version: "1.0.50"
 slug: "homeassistant_club_dashboard_api"
 init: false
+homeassistant_api: true
 arch:
   - aarch64
   - amd64
