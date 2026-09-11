@@ -10,7 +10,7 @@ club_name="$(bashio::config 'club_name')"
 echo "$(bashio::config 'club_name')"
 
 ha_token="$(bashio::config 'home_assistant_access_token')"
-echo "$(bashio::config 'home_assistant_access_token')"
+# Removed 2026-09-11: was `echo "$(bashio::config 'home_assistant_access_token')"` -- printed the secret in plaintext to the add-on log
 
 mqtt_broker="$(bashio::config 'mqtt_broker')"
 echo "$(bashio::config 'mqtt_broker')"
@@ -25,7 +25,7 @@ back_end_url="$(bashio::config 'back_end_url')"
 echo "$(bashio::config 'back_end_url')"
 
 ok_cloud_access_token="$(bashio::config 'ok_cloud_access_token')"
-echo "$(bashio::config 'ok_cloud_access_token')"
+# Removed 2026-09-11: was `echo "$(bashio::config 'ok_cloud_access_token')"` -- printed the secret in plaintext to the add-on log
 
 facility_id="$(bashio::config 'facility_id')"
 echo "$(bashio::config 'facility_id')"

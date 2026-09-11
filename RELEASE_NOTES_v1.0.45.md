@@ -383,9 +383,6 @@ During the file comparison for this version, actual changes were detected in:
 A `__pycache__` file also appeared inside the modified ZIP package. This file is not required for add-on functionality and can be removed before publishing the final version to keep the package clean. 
 
 
-
-
-
 # Release notes — Homeassistant Sports Club Dashboard API v1.0.45
 
 ## Objetivo de la versión

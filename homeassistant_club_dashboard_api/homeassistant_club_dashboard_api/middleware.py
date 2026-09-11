@@ -4,18 +4,21 @@ import logging
 
 class Middleware():
     def validateAccessToken(token):
-        logging.info('Token-------------')
-        logging.info(token)
-        logging.info('Token-------------')
+        # Removed 2026-09-11: was logging the client-provided token in
+        # plaintext ("logging.info(token)").
         try:
-            url = "http://homeassistant.local:8123/api/"
+            # Fixed 2026-09-11: was 'http://homeassistant.local:8123/api/'.
+            # This validates a token the *client/dashboard* sends in, not
+            # this add-on's own token -- so the Authorization header still
+            # carries the caller's token unchanged. Only the transport URL
+            # moves to the Supervisor proxy, which forwards to Core.
+            url = "http://supervisor/core/api/"
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Authorization": str(token)
             }
-            
-            response = requests.get(url, headers=headers)
-            print(response)
+
+            response = requests.get(url, headers=headers, timeout=(3, 5))
 
             if response.status_code == 200:
                 return True

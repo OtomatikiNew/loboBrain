@@ -9,6 +9,16 @@ import ssl
 #
 # Args:
 #
+# DEPRECATED 2026-09-11 -- not imported or instantiated anywhere in this
+# repository (verified: `grep -rn "SyltekIntegration(" .` only matches the
+# class definition itself). Left in place only in case an external
+# AppDaemon apps.yaml still references it by class name. Its own
+# clear_all_entities() below was even more dangerous than the one removed
+# from __main__.py -- it deleted EVERY entity in Home Assistant, not just
+# binary_sensor.* ones -- so it has been neutralized into a no-op.
+# Do not re-enable it without first switching to an explicit, LoboBrain-
+# owned entity list, the same way __main__.py's version should be if it's
+# ever needed again.
 
 
 class SyltekIntegration(hass.Hass):
@@ -35,36 +45,28 @@ class SyltekIntegration(hass.Hass):
 
     self.log("Club UUID: {}".format(self.uuid))
 
-    clearing = True
-    if(self.args["fresh_run"]):
-      clearing = True
-    if clearing:
-      self.clear_all_entities()
+    # Neutralized 2026-09-11: this used to unconditionally call
+    # clear_all_entities(), which deleted EVERY entity in Home Assistant
+    # (see deprecation notice at top of file). clear_all_entities() itself
+    # is now a no-op below, kept only so this call doesn't raise if the
+    # class is still loaded by an external config.
+    self.clear_all_entities()
 
     # Call the function to fetch data from the API
     self.fetch_data_with_uuid(self.api_genaration_url, self.uuid)
   
   #Clear all entities in the Home Assistant
   def clear_all_entities(self):
-    self.log("home_assistant_access_key in clearing function: {}".format(self.home_assistant_access_key))
-    try:
-      # Replace with your Home Assistant access token
-      access_token = self.home_assistant_access_key
-
-      # Headers for the request
-      headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-      }
-      response6 = requests.get(self.home_assistant_url+'/api/states',headers=headers)
-      self.log(response6.text)
-
-      data = response6.json()
-      for item in data:
-        response7=requests.delete(self.home_assistant_url+'/api/states/'+item['entity_id'],headers=headers)
-        self.log(response7.json())
-    except Exception as e:
-        self.log(f"An error occurred: {e}")
+    # Neutralized 2026-09-11: this used to delete EVERY entity in the
+    # whole Home Assistant instance (no filtering at all, worse than the
+    # binary_sensor-only version that was in __main__.py). See the
+    # deprecation notice at the top of this file.
+    self.log(
+        "clear_all_entities() was called but is disabled -- it used to "
+        "delete every entity in Home Assistant unconditionally. No action "
+        "taken."
+    )
+    return
 
   #Get apiKey and tenant with UUID
   def fetch_data_with_uuid(self, api_genaration_url, uuid):

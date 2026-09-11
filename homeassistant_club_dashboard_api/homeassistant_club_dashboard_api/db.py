@@ -57,7 +57,8 @@ def createTables():
 #         return e
 
 def getDoors(ok_cloud_access_token,back_end_url,club_id, facility_id):
-    logging.info(ok_cloud_access_token)
+    # Removed 2026-09-11: was logging.info(ok_cloud_access_token) -- printed
+    # the OK Cloud access token in plaintext.
     try:
         # Assuming ok_cloud_access_token is your bearer token
         headers = {
